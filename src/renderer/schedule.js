@@ -1,0 +1,13 @@
+import {$,esc,date} from './shared.js';
+document.body.classList.toggle('windows',window.pulse.platform==='win32');
+let settings,ready=false,cronGeneration=0;
+const dirty=()=>{if(ready)void window.pulse.setPreferencesDirty(true);};
+function showCronFields(){const f=$('frequency').value;$('minuteField').classList.toggle('hidden',['interval','custom'].includes(f));$('hourField').classList.toggle('hidden',!['day','week'].includes(f));$('intervalField').classList.toggle('hidden',f!=='interval');$('weekField').classList.toggle('hidden',f!=='week');$('cron').readOnly=f!=='custom';}
+async function previewCron(){const gen=++cronGeneration;try{const dates=await window.pulse.previewCron($('cron').value);if(gen!==cronGeneration)return;$('nextRuns').innerHTML=dates.map(d=>`<li>${esc(date(d))}</li>`).join('');$('error').textContent='';}catch(err){if(gen!==cronGeneration)return;$('nextRuns').innerHTML='';$('error').textContent=err.message;}}
+function updateCron(){showCronFields();const f=$('frequency').value,m=$('minute').value,h=$('hour').value;if(f==='hour')$('cron').value=`${m} * * * *`;if(f==='day')$('cron').value=`${m} ${h} * * *`;if(f==='week')$('cron').value=`${m} ${h} * * ${$('week').value}`;if(f==='interval')$('cron').value=`*/${$('interval').value} * * * *`;dirty();void previewCron();}
+async function init(){try{const data=await window.pulse.preferencesData();if(data.kind!=='schedule')throw Error('计划窗口类型错误');settings=data.settings;$('scheduleEnabled').checked=settings.scheduleEnabled;$('cron').value=settings.cron;$('frequency').value=settings.cron==='0 * * * *'?'hour':'custom';$('timezone').textContent='本机时区：'+data.timezone;showCronFields();await previewCron();ready=true;$('frequency').focus();}catch(err){$('error').textContent=err.message;}}
+for(const key of ['frequency','minute','hour','interval','week'])$(key).oninput=updateCron;$('cron').oninput=()=>{dirty();void previewCron();};$('scheduleEnabled').onchange=dirty;
+async function close(){try{await window.pulse.closePreferences(false);}catch(err){$('error').textContent=err.message;}}
+$('cancel').onclick=$('cancelTop').onclick=close;document.addEventListener('keydown',e=>{if(e.key==='Escape')close();});
+$('scheduleForm').onsubmit=async e=>{e.preventDefault();$('error').textContent='';const buttons=[...document.querySelectorAll('button')];buttons.forEach(b=>b.disabled=true);try{await window.pulse.saveSettings({...settings,cron:$('cron').value,scheduleEnabled:$('scheduleEnabled').checked});await window.pulse.closePreferences(true);}catch(err){$('error').textContent=err.message;buttons.forEach(b=>b.disabled=false);}};
+init();

@@ -1,0 +1,13 @@
+import {$,labels} from './shared.js';
+document.body.classList.toggle('windows',window.pulse.platform==='win32');
+let protocol='chat',id=null;
+function choose(value){protocol=value;document.querySelectorAll('[data-protocol]').forEach(b=>b.classList.toggle('selected',b.dataset.protocol===value));$('reasoning').disabled=value==='anthropic';if(value==='anthropic')$('reasoning').value='';$('reasoningHint').textContent=value==='anthropic'?'Anthropic thinking 可在额外参数 JSON 中配置。':'仅发送你明确选择的推理参数。';preview();}
+function preview(){const paths={chat:'/chat/completions',responses:'/responses',anthropic:'/messages'};const base=$('host').value.replace(/\/+$/,'');$('endpointPreview').textContent=base?(base.endsWith(paths[protocol])?base:base+paths[protocol]):'—';}
+async function init(){try{const {model,settings,secureAvailable}=await window.pulse.editorData();if(model){id=model.id;$('title').textContent='编辑模型';document.title='编辑模型 · ModelPulse';for(const key of ['name','modelId','host','notes','reasoning','context'])$(key).value=model[key]??'';$('extra').value=Object.keys(model.extra).length?JSON.stringify(model.extra,null,2):'';$('enabled').checked=model.enabled;if(model.hasSecret){$('apiKey').placeholder='已安全保存，留空保留原值';$('clearSecretRow').classList.remove('hidden');}choose(model.protocol);}else choose('chat');$('testDefaults').textContent=`统一测试配置：最多 ${settings.maxTokens} tokens · 超时 ${settings.timeout} 秒`;
+if(!secureAvailable)$('secretHint').textContent='系统安全存储不可用；请启用密钥环后再保存凭据。';$('name').focus();}catch(err){$('error').textContent=err.message;}}
+document.querySelectorAll('[data-protocol]').forEach(b=>b.onclick=()=>choose(b.dataset.protocol));$('host').oninput=preview;
+$('reveal').onclick=()=>{const reveal=$('apiKey').type==='password';$('apiKey').type=reveal?'text':'password';$('reveal').textContent=reveal?'隐藏':'显示';};
+async function close(){try{await window.pulse.closeEditor();}catch(err){$('error').textContent=err.message;}}
+$('cancel').onclick=$('cancelTop').onclick=close;document.addEventListener('keydown',e=>{if(e.key==='Escape')close();});
+$('modelForm').onsubmit=async e=>{e.preventDefault();$('error').textContent='';const buttons=[...document.querySelectorAll('button')];buttons.forEach(b=>b.disabled=true);try{const model={id,protocol,enabled:$('enabled').checked,clearSecret:$('clearSecret').checked};for(const key of ['name','modelId','host','apiKey','headers','extra','reasoning','context','notes'])model[key]=$(key).value;await window.pulse.saveModel(model,e.submitter?.value==='test');$('apiKey').value='';$('headers').value='';await close();}catch(err){$('error').textContent=err.message;}finally{buttons.forEach(b=>b.disabled=false);}};
+init();

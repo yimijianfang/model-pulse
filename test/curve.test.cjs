@@ -1,0 +1,2 @@
+const test=require('node:test'),assert=require('node:assert/strict');
+test('curve uses measured endpoints and bounded Bezier controls without overshoot',async()=>{const {smoothPath}=await import('../src/renderer/curve.mjs');assert.equal(smoothPath([]),'');assert.equal(smoothPath([[1,2]]),'M1,2');assert.equal(smoothPath([[0,20],[10,10],[20,30]]),'M0,20 C5,20 5,10 10,10 C15,10 15,30 20,30');assert.equal(smoothPath([[0,1],[0,2]]),'M0,1 L0,2');});

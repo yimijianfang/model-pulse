@@ -1,0 +1,85 @@
+{
+  "name": "model-pulse",
+  "version": "0.1.1",
+  "description": "跨平台模型 API 管理与定时性能监测桌面应用",
+  "main": "src/main.cjs",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/yimijianfang/model-pulse.git"
+  },
+  "keywords": [
+    "electron",
+    "llm",
+    "benchmark",
+    "monitoring",
+    "openai",
+    "anthropic"
+  ],
+  "private": true,
+  "author": "ModelPulse contributors",
+  "engines": {
+    "node": ">=22.14.0"
+  },
+  "scripts": {
+    "start": "electron .",
+    "test": "node --test test/*.test.cjs",
+    "check": "node scripts/check.cjs",
+    "test:desktop": "node scripts/smoke.cjs",
+    "pack": "electron-builder --dir",
+    "dist": "electron-builder",
+    "dist:win": "electron-builder --win nsis",
+    "dist:mac": "electron-builder --mac dmg zip",
+    "dist:linux": "electron-builder --linux AppImage deb"
+  },
+  "dependencies": {
+    "croner": "^9.1.0",
+    "echarts": "^6.1.0",
+    "sql.js": "^1.13.0"
+  },
+  "devDependencies": {
+    "electron": "^44.2.0",
+    "electron-builder": "^26.0.12",
+    "playwright": "^1.55.0"
+  },
+  "build": {
+    "appId": "io.modelpulse.desktop",
+    "productName": "ModelPulse",
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "src/**/*",
+      "assets/icon.png",
+      "package.json"
+    ],
+    "asar": true,
+    "win": {
+      "target": [
+        "nsis"
+      ],
+      "icon": "assets/icon.png"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true
+    },
+    "mac": {
+      "target": [
+        "dmg",
+        "zip"
+      ],
+      "category": "public.app-category.developer-tools",
+      "icon": "assets/icon.png"
+    },
+    "linux": {
+      "target": [
+        "AppImage",
+        "deb"
+      ],
+      "category": "Development",
+      "icon": "assets/icon.png"
+    }
+  }
+}
