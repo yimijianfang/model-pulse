@@ -17,7 +17,10 @@
     "anthropic"
   ],
   "private": true,
-  "author": "ModelPulse contributors",
+  "author": {
+    "name": "ModelPulse contributors",
+    "email": "yimijianfang@users.noreply.github.com"
+  },
   "engines": {
     "node": ">=22.14.0"
   },
