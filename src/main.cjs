@@ -7,8 +7,9 @@ const { normalizeModel,normalizeSettings,jsonObject, fingerprint }=require('./co
 const { benchmark }=require('./core/benchmark.cjs');
 const { buildRunPlan }=require('./core/run-plan.cjs');
 const { median,summarizeModel }=require('./core/aggregate.cjs');
+const { safeHistoryRows,toCsv }=require('./core/export.cjs');
 const { Scheduler,previewCron }=require('./core/scheduler.cjs');
-const { evaluateRanking }=require('./core/ranking.cjs');
+const { evaluateRanking,evaluateMonitoring }=require('./core/ranking.cjs');
 const smoke=process.argv.includes('--smoke-test');
 if(smoke){app.disableHardwareAcceleration();app.commandLine.appendSwitch('disable-gpu');}
 const directory=process.env.MODELPULSE_DATA_DIR||path.join(os.homedir(),'.model-pulse');
@@ -42,26 +43,30 @@ async function runTests(ids,source='manual',mode=source==='scheduled'?'scheduled
   if(busy){if(source==='scheduled')return;throw Error('已有测试进行中，请等待或停止本轮');}
   const models=store.models().filter(m=>ids.includes(m.id));if(!models.length){if(source==='scheduled')return;throw Error('请先添加模型');}
   const settings=store.settings(),roundId=crypto.randomUUID(),results=[],plan=buildRunPlan(models.map(model=>model.id),mode);
-  controller=new AbortController();const signal=controller.signal;busy={source,mode,roundId,total:plan.length,done:0,current:null,round:0,warmup:false};broadcast();
+  const runController=new AbortController(),runState={source,mode,roundId,total:plan.length,done:0,current:null,round:0,warmup:false};controller=runController;const signal=runController.signal;busy=runState;broadcast();
   try{
     for(const step of plan){
-      if(signal.aborted)break;const model=models.find(candidate=>candidate.id===step.modelId);busy.current=model.id;busy.round=step.round;busy.warmup=step.warmup;broadcast();
+      if(signal.aborted)break;const model=models.find(candidate=>candidate.id===step.modelId);runState.current=model.id;runState.round=step.round;runState.warmup=step.warmup;broadcast();
       let result;try{result=await benchmark(model,decrypt(model.id),settings,{signal});}catch{result={modelId:model.id,modelName:model.name,protocol:model.protocol,fingerprint:fingerprint(model,settings),timestamp:new Date().toISOString(),status:'error',error:'凭据不可用，请重新保存模型密钥',tokensPerSecond:null,outputTokens:null,ttftMs:null,totalMs:0,estimated:false};}
       const recorded={...result,source,mode,runId:roundId,round:step.round,warmup:step.warmup};
-      if(!step.warmup){store.addResult(recorded,roundId);results.push(recorded);}busy.done++;broadcast();
+      if(!step.warmup){store.addResult(recorded,roundId);results.push(recorded);}runState.done++;broadcast();
     }
     if(source==='scheduled'&&!signal.aborted){
-      const {state,changes}=evaluateRanking(store.get('ranking',{}),results,settings.threshold,settings.confirmations);
-      store.transaction(()=>{store.set('ranking',state);if(changes.length)store.addNotification({type:'ranking',title:'模型速度排名发生变化',body:changes.map(c=>c.text).join('；'),roundId,changes});});
-      if(changes.length&&settings.desktopNotifications&&Notification.isSupported()){
-        const n=new Notification({title:'ModelPulse · 模型排名变化',body:changes.map(c=>c.text).join('；'),icon:path.join(__dirname,'../assets/icon.png')});n.on('click',()=>showMain('notifications'));n.show();
+      const previous=store.get('ranking',{}),recent=store.recentByModel({limit:10,source:'scheduled'}),comparisonKey=crypto.createHash('sha256').update(JSON.stringify([settings.prompt,settings.maxTokens])).digest('hex');
+      const rolling=models.map(model=>{const summary=summarizeModel((recent[model.id]||[]).filter(sample=>sample.fingerprint===fingerprint(model,settings)));return {summary,modelId:model.id,modelName:model.name,fingerprint:fingerprint(model,settings),comparisonKey,status:summary.generation.eligible>=3?'success':'insufficient',estimated:false,usageSource:'provider',eligibleSamples:summary.generation.eligible,tokensPerSecond:summary.generation.p50};});
+      const ranked=evaluateRanking(previous,rolling,settings.threshold,settings.confirmations),monitored=evaluateMonitoring(previous.monitoring||{},rolling.map(item=>({modelId:item.modelId,modelName:item.modelName,...item.summary})),settings.confirmations),events=[...monitored.events];
+      if(ranked.changes.length)events.push({type:'ranking',title:'模型速度排名发生变化',body:ranked.changes.map(change=>change.text).join('；'),changes:ranked.changes});
+      store.transaction(()=>{store.set('ranking',{...ranked.state,monitoring:monitored.state});for(const event of events)store.addNotification({...event,roundId});});
+      if(events.length&&settings.desktopNotifications&&Notification.isSupported()){
+        const n=new Notification({title:`ModelPulse · ${events[0].title}`,body:events.map(event=>event.body).join('；'),icon:path.join(__dirname,'../assets/icon.png')});n.on('click',()=>showMain('notifications'));n.show();
       }
     } else if(source==='scheduled'&&signal.aborted)store.transaction(()=>store.set('ranking',{}));
     store.prune(settings.retentionDays);
-  } finally {busy=null;controller=null;broadcast();}
+  } finally {if(busy===runState)busy=null;if(controller===runController)controller=null;broadcast();}
 }
 function handle(name,fn){ipcMain.handle(name,async(event,...args)=>{try{const w=BrowserWindow.fromWebContents(event.sender);if(!w||!windows.has(w)||event.senderFrame!==event.sender.mainFrame||!event.senderFrame.url.startsWith(pathToFileURL(renderer+path.sep).href))throw Error('未授权的界面请求');return {ok:true,value:await fn(...args,w)};}catch(err){return {ok:false,error:err.message};}});}
 function ensureIdle(){if(busy)throw Error('测试进行中，请停止本轮后修改配置');}
+function historyFilters(input={},limit=3000){const days=Number(input.days??7),modelId=String(input.modelId||''),mode=String(input.mode||''),status=String(input.status||''),errorCategory=String(input.errorCategory||'');if(![1,7,30,90,3650].includes(days))throw Error('历史范围无效');if(modelId.length>100||!['','quick','standard','scheduled'].includes(mode)||!['','success','error','cancelled'].includes(status)||!['','authentication','rate_limit','timeout','connection','protocol','invalid_output','cancelled','unknown'].includes(errorCategory))throw Error('历史筛选条件无效');return {modelId,days,mode,status,errorCategory,limit};}
 app.on('before-quit',()=>{quitting=true;scheduler?.stop();controller?.abort();});
 app.on('window-all-closed',()=>{if(!tray)app.quit();});
 if(!app.requestSingleInstanceLock()){app.quit();}else{
@@ -95,7 +100,7 @@ app.whenReady().then(async()=>{
   });
   handle('preferences:data',w=>{if(!w.preferenceKind)throw Error('非设置窗口');return {kind:w.preferenceKind,settings:store.settings(),packaged:app.isPackaged,timezone:Intl.DateTimeFormat().resolvedOptions().timeZone};});
   handle('preferences:dirty',(value,w)=>{if(!w.preferenceKind)throw Error('非设置窗口');w.preferenceDirty=!!value;});
-  handle('preferences:close',(saved,w)=>{if(!w.preferenceKind)throw Error('非设置窗口');w.preferenceDirty=false;w.preferenceClosing=true;if(saved&&main&&!main.isDestroyed())main.webContents.send('toast',w.preferenceKind==='settings'?'运行设置已保存':'全局计划已保存');w.close();});
+  handle('preferences:close',(saved,w)=>{if(!w.preferenceKind)throw Error('非设置窗口');if(saved){w.preferenceDirty=false;w.preferenceClosing=true;if(main&&!main.isDestroyed())main.webContents.send('toast',w.preferenceKind==='settings'?'运行设置已保存':'全局计划已保存');}w.close();});
   handle('editor:data',()=>({model:editor?.modelId?store.model(editor.modelId):null,settings:store.settings(),secureAvailable:secureAvailable()}));
   handle('editor:close',()=>editor?.close());
   handle('model:save',async(input,test)=>{
@@ -116,11 +121,12 @@ app.whenReady().then(async()=>{
   });
   handle('model:toggle',(id,enabled)=>{ensureIdle();const m=store.model(id);if(!m)throw Error('模型不存在');const {hasSecret,...config}=m;store.saveModel({...config,enabled:!!enabled},store.secret(id));broadcast();});
   handle('model:delete',async id=>{ensureIdle();if(!store.model(id))throw Error('模型不存在');const answer=await dialog.showMessageBox(main,{type:'question',buttons:['取消','删除'],defaultId:0,cancelId:0,message:'删除此模型配置？',detail:'历史测试记录会保留，密钥及配置将删除。'});if(answer.response===1){store.deleteModel(id);broadcast();}});
-  handle('test:run',(ids,mode='quick')=>{if(!Array.isArray(ids)||ids.some(id=>typeof id!=='string'))throw Error('模型列表无效');if(!ids.length||ids.some(id=>!store.model(id)))throw Error('请选择有效模型');if(!['quick','standard'].includes(mode))throw Error('运行模式无效');if(busy)throw Error('已有测试正在运行');void runTests(ids,'manual',mode).catch(()=>{});});
+  handle('test:run',async(ids,mode='quick')=>{if(!Array.isArray(ids)||ids.some(id=>typeof id!=='string'))throw Error('模型列表无效');if(!ids.length||ids.some(id=>!store.model(id)))throw Error('请选择有效模型');if(!['quick','standard'].includes(mode))throw Error('运行模式无效');if(busy)throw Error('已有测试正在运行');if(mode==='standard'){const answer=await dialog.showMessageBox(main,{type:'question',buttons:['取消','开始标准基准'],defaultId:0,cancelId:0,message:'开始标准基准？',detail:`将执行 ${ids.length} 个模型 ×（1 次预热 + 3 次正式采样），共 ${ids.length*4} 次 API 请求，可能产生费用。`});if(answer.response!==1)return false;}void runTests(ids,'manual',mode).catch(err=>{store.transaction(()=>store.addNotification({type:'error',title:'测试运行未完成',body:err.message}));broadcast();});return true;});
   handle('test:stop',()=>controller?.abort());
   handle('cron:preview',expression=>previewCron(expression));
   handle('settings:save',input=>{ensureIdle();const value=normalizeSettings(input);previewCron(value.cron);const old=store.settings();if(old.autoStart!==value.autoStart)autostart(value.autoStart);store.transaction(()=>{store.set('settings',value);if(['prompt','maxTokens','timeout','threshold','confirmations'].some(k=>old[k]!==value[k]))store.set('ranking',{});});scheduler.configure(value);broadcast();return value;});
-  handle('history',input=>{const days=Number(input?.days??7);if(![1,7,30,90,3650].includes(days))throw Error('历史范围无效');return store.history({modelId:String(input?.modelId||''),days,limit:3000});});
+  handle('history',input=>store.history(historyFilters(input,3000)));
+  handle('history:export',async(input,format)=>{if(!['csv','json'].includes(format))throw Error('导出格式无效');const filters=historyFilters(input,10000),rows=safeHistoryRows(store.history(filters)),result=await dialog.showSaveDialog(main,{title:`导出测试历史（${format.toUpperCase()}）`,defaultPath:`model-pulse-history.${format}`,filters:[{name:format.toUpperCase(),extensions:[format]}]});if(result.canceled)return false;const content=format==='csv'?toCsv(rows):JSON.stringify({version:1,exportedAt:new Date().toISOString(),filters:{...filters,limit:undefined},rows},null,2);fs.writeFileSync(result.filePath,content,{encoding:'utf8',mode:0o600});return true;});
   handle('notifications:clear',async()=>{
     const answer=await dialog.showMessageBox(main,{type:'warning',buttons:['取消','清空全部通知'],defaultId:0,cancelId:0,message:'清空全部通知记录？',detail:'这会永久删除数据库中的全部通知，此操作无法撤销。'});
     if(answer.response!==1)return false;store.clearNotifications();broadcast();return true;

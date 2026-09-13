@@ -23,3 +23,7 @@ test('history uses ECharts dataZoom and synchronizes legend selection',()=>{
 test('window bar and tabs both use sticky positioning',()=>{
   const css=read('src/renderer/styles.css');assert.match(css,/\.windowbar\{position:sticky/);assert.match(css,/main>\.tabs\{position:sticky/);
 });
+
+test('professional overview exposes health metrics and both benchmark modes',()=>{const html=read('src/renderer/index.html'),app=read('src/renderer/app.js');for(const id of ['healthyCount','lastRunSuccess','p50Ttft','p50Generation','incidentCount','nextRun','benchmarkAll'])assert.match(html,new RegExp(`id="${id}"`));assert.match(app,/runTests\([^)]*'standard'/);assert.match(app,/summary\.health/);assert.match(app,/generation\?\.p50/);});
+
+test('history offers professional metrics, diagnostics filters and safe export controls',()=>{const html=read('src/renderer/index.html'),app=read('src/renderer/app.js'),preload=read('src/preload.cjs');for(const value of ['generationTokensPerSecond','charactersPerSecond'])assert.match(html,new RegExp(`value="${value}"`));for(const id of ['historyMode','historyStatus','historyError','exportCsv','exportJson'])assert.match(html,new RegExp(`id="${id}"`));assert.match(app,/exportHistory/);assert.match(preload,/history:export/);});

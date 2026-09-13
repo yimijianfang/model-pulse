@@ -1,6 +1,6 @@
 {
   "name": "model-pulse",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "跨平台模型 API 管理与定时性能监测桌面应用",
   "main": "src/main.cjs",
   "license": "MIT",

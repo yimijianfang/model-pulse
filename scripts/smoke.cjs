@@ -4,6 +4,7 @@ const root=path.resolve(__dirname,'..'),artifacts=path.join(root,'artifacts');fs
 const data=fs.mkdtempSync(path.join(artifacts,'smoke-data-'));
 let app;const requests=[];
 const launchOptions=()=>({args:process.env.MODELPULSE_EXECUTABLE?['--disable-gpu','--smoke-test']:['--disable-gpu',root,'--smoke-test'],...(process.env.MODELPULSE_EXECUTABLE?{executablePath:process.env.MODELPULSE_EXECUTABLE}:{}),timeout:60000});
+async function waitForSnapshot(page,predicate,timeout=30000){const deadline=Date.now()+timeout;while(Date.now()<deadline){const snapshot=await page.evaluate(()=>window.pulse.snapshot());if(predicate(snapshot))return snapshot;await page.waitForTimeout(50);}throw Error('Timed out waiting for ModelPulse state');}
 const server=http.createServer(async(req,res)=>{
   let body='';for await(const c of req)body+=c;const json=JSON.parse(body);requests.push({url:req.url,body:json,key:req.headers.authorization||req.headers['x-api-key']});
   res.writeHead(200,{'Content-Type':'text/event-stream'});const send=event=>res.write('data: '+JSON.stringify(event)+'\n\n');
@@ -15,7 +16,7 @@ const server=http.createServer(async(req,res)=>{
   const env={...process.env,MODELPULSE_DATA_DIR:data};delete env.ELECTRON_RUN_AS_NODE;
   app=await electron.launch({...launchOptions(),env});
   const page=await app.firstWindow();const errors=[];page.on('pageerror',e=>errors.push(e.message));
-  await page.waitForFunction(()=>document.getElementById('version')?.textContent==='v0.1.1'&&window.pulse);
+  await page.waitForFunction(()=>document.getElementById('version')?.textContent==='v0.2.0'&&window.pulse);
   assert.equal(await page.locator('#modelCount').textContent(),'0');
   const geometry=await app.evaluate(({BrowserWindow,screen,nativeTheme})=>({bounds:BrowserWindow.getAllWindows()[0].getBounds(),area:screen.getPrimaryDisplay().workAreaSize,dark:nativeTheme.shouldUseDarkColors}));
   assert.ok(Math.abs(geometry.bounds.width-Math.min(1280,Math.round(geometry.area.width*.4)))<=2);assert.ok(Math.abs(geometry.bounds.height/geometry.bounds.width-.618)<.01);assert.equal(geometry.dark,true);
@@ -29,10 +30,11 @@ const server=http.createServer(async(req,res)=>{
     await page.waitForFunction(async()=>{const s=await window.pulse.snapshot();return !s.busy&&s.latest.length===s.models.length;});
   }
   let s=await page.evaluate(()=>window.pulse.snapshot());assert.equal(s.models.length,3);assert.ok(s.latest.every(r=>r.status==='success'&&!r.estimated));assert.equal(requests.length,3);assert.ok(requests.every(r=>r.key?.includes('fixture-secret')));assert.ok(!JSON.stringify(s).includes('fixture-secret'));
+  await app.evaluate(({dialog})=>{dialog.showMessageBox=async()=>({response:1});});await page.waitForTimeout(250);await waitForSnapshot(page,snapshot=>!snapshot.busy);await page.evaluate(ids=>window.pulse.runTests(ids,'standard'),s.models.map(model=>model.id));const active=await waitForSnapshot(page,snapshot=>snapshot.busy?.mode==='standard');assert.equal(active.busy.total,12);s=await waitForSnapshot(page,snapshot=>!snapshot.busy);assert.equal(requests.length,15);assert.ok(Object.values(s.summaries).every(summary=>summary.sampleCount===4));
   const layout=await page.locator('#cards').evaluate(el=>({width:innerWidth,columns:getComputedStyle(el).gridTemplateColumns.split(' ').length}));if(layout.width>500&&layout.width<1080)assert.equal(layout.columns,2);
   if(!process.env.MODELPULSE_EXECUTABLE)await page.screenshot({path:path.join(artifacts,'models.png')});
   const sticky=await page.evaluate(()=>{document.querySelector('#cards').style.paddingBottom='1200px';scrollTo(0,800);const bar=document.querySelector('.windowbar').getBoundingClientRect(),tabs=document.querySelector('.tabs').getBoundingClientRect();return {barTop:bar.top,tabsTop:tabs.top};});assert.ok(sticky.barTop>=31&&sticky.barTop<34);assert.ok(sticky.tabsTop>=80&&sticky.tabsTop<88);await page.evaluate(()=>{scrollTo(0,0);document.querySelector('#cards').style.paddingBottom='';});
-  await page.locator('[data-view="history"]').click();await page.waitForSelector('#chart canvas');if(!process.env.MODELPULSE_EXECUTABLE)await page.screenshot({path:path.join(artifacts,'history.png')});assert.equal(await page.locator('.history-row').count(),3);
+  await page.locator('[data-view="history"]').click();await page.waitForSelector('#chart canvas');if(!process.env.MODELPULSE_EXECUTABLE)await page.screenshot({path:path.join(artifacts,'history.png')});assert.equal(await page.locator('.history-row').count(),12);
   const firstModelId=s.models[0].id;await page.evaluate(id=>echarts.getInstanceByDom(document.querySelector('#chart')).dispatchAction({type:'legendToggleSelect',name:id}),firstModelId);assert.ok(await page.locator(`.history-row[data-model-id="${firstModelId}"]`).count()===0);
   await page.evaluate(()=>echarts.getInstanceByDom(document.querySelector('#chart')).dispatchAction({type:'dataZoom',start:20,end:80}));await page.locator('#historyMetric').selectOption('ttftMs');const zoom=await page.evaluate(()=>echarts.getInstanceByDom(document.querySelector('#chart')).getOption().dataZoom[0]);assert.equal(Math.round(zoom.start),20);assert.equal(Math.round(zoom.end),80);
   await page.locator('[data-view="models"]').click();const schedulePromise=app.waitForEvent('window');await page.locator('#scheduleOpen').click();const scheduleWindow=await schedulePromise;await scheduleWindow.waitForSelector('#nextRuns li');assert.equal(await scheduleWindow.locator('#nextRuns li').count(),5);const countBefore=await app.evaluate(({BrowserWindow})=>BrowserWindow.getAllWindows().length);await page.locator('#scheduleOpen').click();assert.equal(await app.evaluate(({BrowserWindow})=>BrowserWindow.getAllWindows().length),countBefore);
