@@ -2,6 +2,7 @@ node_modules/
 release/
 artifacts/
 work/
+.worktrees/
 .env*
 !.env.example
 *.log
