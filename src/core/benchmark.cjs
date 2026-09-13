@@ -1,6 +1,7 @@
 'use strict';
 const { performance } = require('node:perf_hooks');
-const { endpoint, fingerprint } = require('./config.cjs');
+const { endpoint, fingerprint, PROMPT } = require('./config.cjs');
+const { validateOutput } = require('./validation.cjs');
 function requestSpec(model, secret, settings) {
   const body = { ...model.extra, model: model.modelId, stream: true };
   const headers = { ...secret.headers };
@@ -44,20 +45,21 @@ async function* sse(stream) {
   const data = parse(event); if (data) yield data;
 }
 const positive = x => Number.isFinite(x) && x > 0;
+function failure(category, message) { const err = Error(message); err.category = category; return err; }
 async function benchmark(model, secret, settings, { signal, fetchImpl = fetch } = {}) {
   const start = performance.now(); let first = null, text = '', usage = null, reasoningTokens = null, completed = false, terminal = null, truncated = false;
-  const result = { modelId: model.id, modelName: model.name, protocol: model.protocol, fingerprint: fingerprint(model, settings), timestamp: new Date().toISOString(), settings: { prompt: settings.prompt, maxTokens: settings.maxTokens, timeout: settings.timeout }, status: 'error', tokensPerSecond: null, outputTokens: null, ttftMs: null, estimated: false };
+  const result = { modelId: model.id, modelName: model.name, protocol: model.protocol, fingerprint: fingerprint(model, settings), timestamp: new Date().toISOString(), settings: { prompt: settings.prompt, maxTokens: settings.maxTokens, timeout: settings.timeout }, status: 'error', tokensPerSecond: null, effectiveTokensPerSecond: null, generationTokensPerSecond: null, charactersPerSecond: null, generationMs: null, outputTokens: null, outputCharacters: null, ttftMs: null, estimated: false, usageSource: null, validation: null, benchmarkProfile: null, errorCategory: null };
   try {
     const spec = requestSpec(model, secret, settings);
     const timeout = AbortSignal.timeout(settings.timeout * 1000);
     const combined = signal ? AbortSignal.any([signal, timeout]) : timeout;
     const response = await fetchImpl(spec.url, { method: 'POST', headers: spec.headers, body: JSON.stringify(spec.body), signal: combined, redirect: 'error' });
-    if (!response.ok) { await response.body?.cancel(); throw Error(`HTTP ${response.status}：${response.status===401||response.status===403?'认证失败，请检查密钥和权限':response.status===429?'请求限流或额度不足':'服务商请求失败'}`); }
-    if (!response.body || !response.headers.get('content-type')?.includes('text/event-stream')) { await response.body?.cancel(); throw Error('接口未返回 SSE 流，请检查协议和地址'); }
+    if (!response.ok) { await response.body?.cancel(); const category=response.status===401||response.status===403?'authentication':response.status===429?'rate_limit':'protocol'; throw failure(category,`HTTP ${response.status}：${category==='authentication'?'认证失败，请检查密钥和权限':category==='rate_limit'?'请求限流或额度不足':'服务商请求失败'}`); }
+    if (!response.body || !response.headers.get('content-type')?.includes('text/event-stream')) { await response.body?.cancel(); throw failure('protocol','接口未返回 SSE 流，请检查协议和地址'); }
     for await (const raw of sse(response.body)) {
       if (raw === '[DONE]') { completed = true; terminal = performance.now(); break; }
-      let event; try { event = JSON.parse(raw); } catch { throw Error('接口返回了无效 SSE JSON'); }
-      if (event.error || event.type === 'error' || event.type === 'response.failed') throw Error('服务商返回流式错误；请检查模型、参数或额度');
+      let event; try { event = JSON.parse(raw); } catch { throw failure('protocol','接口返回了无效 SSE JSON'); }
+      if (event.error || event.type === 'error' || event.type === 'response.failed') throw failure('protocol','服务商返回流式错误；请检查模型、参数或额度');
       let delta = '';
       if (model.protocol === 'chat') {
         delta = event.choices?.[0]?.delta?.content || '';
@@ -80,16 +82,18 @@ async function benchmark(model, secret, settings, { signal, fetchImpl = fetch } 
       if (text.length > 2000000) throw Error('输出超过安全大小上限');
       if (completed && model.protocol !== 'chat') break;
     }
-    if (!completed) throw Error('连接提前结束，未收到完成事件');
-    if (first === null || !text.trim()) throw Error('未收到文本输出，无法计算测速结果');
+    if (!completed) throw failure('protocol','连接提前结束，未收到完成事件');
+    if (first === null || !text.trim()) throw failure('protocol','未收到文本输出，无法计算测速结果');
     const totalMs = Math.max((terminal ?? performance.now()) - start, 1);
     const estimated = !positive(usage); const outputTokens = estimated ? Math.max(1,Math.ceil([...text].length/4)) : usage;
-    return { ...result, status: 'success', totalMs, ttftMs: first-start, outputTokens, reasoningTokens, estimated, truncated, tokensPerSecond: outputTokens/(totalMs/1000), error: null };
+    const outputCharacters=[...text].length,generationMs=Math.max((terminal??performance.now())-first,1),effectiveTokensPerSecond=outputTokens/(totalMs/1000),validation=validateOutput(settings.prompt,text,PROMPT);
+    return { ...result, status: 'success', totalMs, ttftMs: first-start, generationMs, outputTokens, outputCharacters, reasoningTokens, estimated, usageSource:estimated?'estimated':'provider', validation:validation.state, benchmarkProfile:validation.profile, truncated, tokensPerSecond:effectiveTokensPerSecond, effectiveTokensPerSecond, generationTokensPerSecond:outputTokens/(generationMs/1000), charactersPerSecond:outputCharacters/(generationMs/1000), errorCategory:validation.state==='invalid'?'invalid_output':null, error: null };
   } catch (err) {
     // Never expose upstream payloads or arbitrary error messages containing request secrets.
     const known = /^(HTTP \d{3}|接口|服务商|SSE|输出|连接|未收到|Responses|Anthropic)/.test(err.message);
-    const message = signal?.aborted ? '测试已取消' : ['TimeoutError','AbortError'].includes(err.name) ? '请求超时' : known ? err.message : '网络请求失败，请检查地址、网络或 TLS 证书';
-    return { ...result, status: signal?.aborted ? 'cancelled' : 'error', totalMs: performance.now()-start, ttftMs: first===null?null:first-start, error: message };
+    const cancelled=!!signal?.aborted,timeout=!cancelled&&['TimeoutError','AbortError'].includes(err.name);
+    const message = cancelled ? '测试已取消' : timeout ? '请求超时' : known ? err.message : '网络请求失败，请检查地址、网络或 TLS 证书';
+    return { ...result, status: cancelled ? 'cancelled' : 'error', totalMs: performance.now()-start, ttftMs: first===null?null:first-start, errorCategory:cancelled?'cancelled':timeout?'timeout':err.category||(known?'protocol':'connection'), error: message };
   }
 }
 module.exports = { sse, requestSpec, benchmark };

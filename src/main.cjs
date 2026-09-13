@@ -5,6 +5,8 @@ const {pathToFileURL}=require('node:url');
 const { Store }=require('./core/store.cjs');
 const { normalizeModel,normalizeSettings,jsonObject, fingerprint }=require('./core/config.cjs');
 const { benchmark }=require('./core/benchmark.cjs');
+const { buildRunPlan }=require('./core/run-plan.cjs');
+const { median,summarizeModel }=require('./core/aggregate.cjs');
 const { Scheduler,previewCron }=require('./core/scheduler.cjs');
 const { evaluateRanking }=require('./core/ranking.cjs');
 const smoke=process.argv.includes('--smoke-test');
@@ -35,17 +37,18 @@ function autostart(enabled){
     if(enabled){fs.mkdirSync(dir,{recursive:true});const executable=(process.env.APPIMAGE||process.execPath).replace(/([\\"`$])/g,'\\$1');fs.writeFileSync(file,`[Desktop Entry]\nType=Application\nName=ModelPulse\nExec="${executable}" --hidden\nTerminal=false\nX-GNOME-Autostart-enabled=true\n`);}else if(fs.existsSync(file))fs.unlinkSync(file);
   } else app.setLoginItemSettings({openAtLogin:enabled,path:process.execPath,args:['--hidden']});
 }
-function snapshot(){const models=store.models(),settings=store.settings();return {version:app.getVersion(),models,settings,latest:store.latest().map(r=>{const m=models.find(m=>m.id===r.modelId);return {...r,stale:!!m&&r.fingerprint!==fingerprint(m,settings)};}),stats:store.stats(),notifications:store.notifications(),busy,nextRun:scheduler.next(),directory,secureAvailable:secureAvailable(),packaged:app.isPackaged,timezone:Intl.DateTimeFormat().resolvedOptions().timeZone};}
-async function runTests(ids,source='manual'){
+function snapshot(){const models=store.models(),settings=store.settings(),recent=store.recentByModel({limit:10});const summaries=Object.fromEntries(models.map(model=>[model.id,summarizeModel((recent[model.id]||[]).filter(sample=>sample.fingerprint===fingerprint(model,settings)))]));const overview={...store.overview(),healthyModels:Object.values(summaries).filter(summary=>summary.health==='healthy').length,p50Ttft:median(Object.values(summaries).map(summary=>summary.ttft.p50)),p50GenerationTokensPerSecond:median(Object.values(summaries).map(summary=>summary.generation.p50))};return {version:app.getVersion(),models,settings,latest:store.latest().map(r=>{const m=models.find(m=>m.id===r.modelId);return {...r,stale:!!m&&r.fingerprint!==fingerprint(m,settings)};}),stats:store.stats(),overview,summaries,notifications:store.notifications(),busy,nextRun:scheduler.next(),directory,secureAvailable:secureAvailable(),packaged:app.isPackaged,timezone:Intl.DateTimeFormat().resolvedOptions().timeZone};}
+async function runTests(ids,source='manual',mode=source==='scheduled'?'scheduled':'quick'){
   if(busy){if(source==='scheduled')return;throw Error('已有测试进行中，请等待或停止本轮');}
   const models=store.models().filter(m=>ids.includes(m.id));if(!models.length){if(source==='scheduled')return;throw Error('请先添加模型');}
-  const settings=store.settings(),roundId=crypto.randomUUID(),results=[];
-  controller=new AbortController();const signal=controller.signal;busy={source,roundId,total:models.length,done:0,current:null};broadcast();
+  const settings=store.settings(),roundId=crypto.randomUUID(),results=[],plan=buildRunPlan(models.map(model=>model.id),mode);
+  controller=new AbortController();const signal=controller.signal;busy={source,mode,roundId,total:plan.length,done:0,current:null,round:0,warmup:false};broadcast();
   try{
-    for(const model of models){
-      if(signal.aborted)break;busy.current=model.id;broadcast();
+    for(const step of plan){
+      if(signal.aborted)break;const model=models.find(candidate=>candidate.id===step.modelId);busy.current=model.id;busy.round=step.round;busy.warmup=step.warmup;broadcast();
       let result;try{result=await benchmark(model,decrypt(model.id),settings,{signal});}catch{result={modelId:model.id,modelName:model.name,protocol:model.protocol,fingerprint:fingerprint(model,settings),timestamp:new Date().toISOString(),status:'error',error:'凭据不可用，请重新保存模型密钥',tokensPerSecond:null,outputTokens:null,ttftMs:null,totalMs:0,estimated:false};}
-      store.addResult({...result,source},roundId);results.push(result);busy.done++;broadcast();
+      const recorded={...result,source,mode,runId:roundId,round:step.round,warmup:step.warmup};
+      if(!step.warmup){store.addResult(recorded,roundId);results.push(recorded);}busy.done++;broadcast();
     }
     if(source==='scheduled'&&!signal.aborted){
       const {state,changes}=evaluateRanking(store.get('ranking',{}),results,settings.threshold,settings.confirmations);
@@ -113,7 +116,7 @@ app.whenReady().then(async()=>{
   });
   handle('model:toggle',(id,enabled)=>{ensureIdle();const m=store.model(id);if(!m)throw Error('模型不存在');const {hasSecret,...config}=m;store.saveModel({...config,enabled:!!enabled},store.secret(id));broadcast();});
   handle('model:delete',async id=>{ensureIdle();if(!store.model(id))throw Error('模型不存在');const answer=await dialog.showMessageBox(main,{type:'question',buttons:['取消','删除'],defaultId:0,cancelId:0,message:'删除此模型配置？',detail:'历史测试记录会保留，密钥及配置将删除。'});if(answer.response===1){store.deleteModel(id);broadcast();}});
-  handle('test:run',ids=>{if(!Array.isArray(ids)||ids.some(id=>typeof id!=='string'))throw Error('模型列表无效');if(!ids.length||ids.some(id=>!store.model(id)))throw Error('请选择有效模型');if(busy)throw Error('已有测试正在运行');void runTests(ids).catch(()=>{});});
+  handle('test:run',(ids,mode='quick')=>{if(!Array.isArray(ids)||ids.some(id=>typeof id!=='string'))throw Error('模型列表无效');if(!ids.length||ids.some(id=>!store.model(id)))throw Error('请选择有效模型');if(!['quick','standard'].includes(mode))throw Error('运行模式无效');if(busy)throw Error('已有测试正在运行');void runTests(ids,'manual',mode).catch(()=>{});});
   handle('test:stop',()=>controller?.abort());
   handle('cron:preview',expression=>previewCron(expression));
   handle('settings:save',input=>{ensureIdle();const value=normalizeSettings(input);previewCron(value.cron);const old=store.settings();if(old.autoStart!==value.autoStart)autostart(value.autoStart);store.transaction(()=>{store.set('settings',value);if(['prompt','maxTokens','timeout','threshold','confirmations'].some(k=>old[k]!==value[k]))store.set('ranking',{});});scheduler.configure(value);broadcast();return value;});
